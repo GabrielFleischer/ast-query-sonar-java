@@ -17,44 +17,34 @@
 package org.sonar.java.model;
 
 import com.sonar.sslr.api.RecognitionException;
-import java.io.File;
-import java.io.InterruptedIOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.EnumMap;
-import java.util.List;
-import java.util.concurrent.CancellationException;
-import java.util.function.Consumer;
-import java.util.function.Predicate;
-import java.util.stream.StreamSupport;
-import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.sonar.api.SonarProduct;
+import org.sonar.api.batch.fs.InputComponent;
 import org.sonar.api.batch.fs.InputFile;
 import org.sonar.api.utils.AnnotationUtils;
 import org.sonar.check.Rule;
-import org.sonar.java.AnalysisException;
-import org.sonar.java.CheckFailureException;
-import org.sonar.java.ExceptionHandler;
-import org.sonar.java.IllegalRuleParameterException;
-import org.sonar.java.SonarComponents;
+import org.sonar.java.*;
 import org.sonar.java.annotations.VisibleForTesting;
 import org.sonar.java.ast.visitors.SonarSymbolTableVisitor;
 import org.sonar.java.ast.visitors.SubscriptionVisitor;
 import org.sonar.java.caching.CacheContextImpl;
 import org.sonar.java.exceptions.ApiMismatchException;
 import org.sonar.java.exceptions.ThrowableUtils;
-import org.sonar.plugins.java.api.InputFileScannerContext;
-import org.sonar.plugins.java.api.IssuableSubscriptionVisitor;
-import org.sonar.plugins.java.api.JavaCheck;
-import org.sonar.plugins.java.api.JavaFileScanner;
-import org.sonar.plugins.java.api.JavaFileScannerContext;
-import org.sonar.plugins.java.api.JavaVersion;
-import org.sonar.plugins.java.api.JavaVersionAwareVisitor;
-import org.sonar.plugins.java.api.ModuleScannerContext;
+import org.sonar.java.reporting.FluentReporting;
+import org.sonar.java.reporting.InternalJavaIssueBuilder;
+import org.sonar.plugins.java.api.*;
 import org.sonar.plugins.java.api.caching.CacheContext;
 import org.sonar.plugins.java.api.internal.EndOfAnalysis;
+import org.sonar.plugins.java.api.query.ManySelector;
+import org.sonar.plugins.java.api.query.QueryRule;
+import org.sonar.plugins.java.api.query.SingleSelector;
+import org.sonar.plugins.java.api.query.graph.exec.ExecutionContext;
+import org.sonar.plugins.java.api.query.graph.exec.ExecutionGraph;
+import org.sonar.plugins.java.api.query.graph.exec.batch.BatchBuilder;
+import org.sonar.plugins.java.api.query.graph.exec.greedy.GreedyBuilder;
+import org.sonar.plugins.java.api.query.graph.ir.nodes.Root;
+import org.sonar.plugins.java.api.query.operation.tree.SubTreeKt;
 import org.sonar.plugins.java.api.semantic.Sema;
 import org.sonar.plugins.java.api.tree.CompilationUnitTree;
 import org.sonar.plugins.java.api.tree.SyntaxToken;
@@ -62,12 +52,23 @@ import org.sonar.plugins.java.api.tree.Tree;
 import org.sonar.plugins.java.api.tree.Tree.Kind;
 import org.sonarsource.performance.measure.PerformanceMeasure;
 
+import javax.annotation.CheckForNull;
+import javax.annotation.Nullable;
+import java.io.File;
+import java.io.InterruptedIOException;
+import java.util.*;
+import java.util.concurrent.CancellationException;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.stream.StreamSupport;
+
 public class VisitorsBridge {
 
   private static final Logger LOG = LoggerFactory.getLogger(VisitorsBridge.class);
+  private static final boolean MEASURE_PERF = true;
 
   private final Iterable<? extends JavaCheck> visitors;
-  private final List<JavaFileScanner> allScanners;
+  public final List<JavaFileScanner> allScanners;
   private final List<JavaFileScanner> scannersThatCannotBeSkipped;
   private final SonarComponents sonarComponents;
   protected InputFile currentFile;
@@ -114,20 +115,35 @@ public class VisitorsBridge {
   private List<JavaFileScanner> filterVisitors(Iterable<? extends JavaCheck> visitors, Predicate<Object> predicate) {
     List<JavaFileScanner> scanners = new ArrayList<>();
     final IssuableSubscriptionVisitorsRunner runner = new IssuableSubscriptionVisitorsRunner();
+    final Root<CompilationUnitTree> root = new Root<>();
+    final ManySelector<CompilationUnitTree, Tree> entry = SubTreeKt.tree(new SingleSelector<>(root, root));
 
     StreamSupport.stream(visitors.spliterator(), false)
       .filter(predicate)
       .forEach(visitor -> {
         if (visitor instanceof IssuableSubscriptionVisitor issuableSubscriptionVisitor) {
           runner.add(issuableSubscriptionVisitor);
+        } else if (visitor instanceof QueryRule queryRule) {
+          queryRule.createQuery(entry);
         } else if (visitor instanceof JavaFileScanner javaFileScanner) {
-          scanners.add(javaFileScanner);
+          if (!MEASURE_PERF || !ruleKey(javaFileScanner).isEmpty()) {
+            scanners.add(javaFileScanner);
+          }
         }
       });
 
     if (!runner.subscriptionVisitors.isEmpty()) {
       scanners.add(runner);
     }
+
+    PerformanceMeasure.Duration buildDuration = PerformanceMeasure.start("Build ExecutionGraph");
+    ExecutionGraph<?, CompilationUnitTree> executionGraph = new BatchBuilder().build(root);
+    if (!executionGraph.getSinks().isEmpty()) {
+      scanners.add(new QueryVisitorsRunner(executionGraph));
+    }
+
+    buildDuration.stop();
+
     return scanners;
   }
 
@@ -171,7 +187,7 @@ public class VisitorsBridge {
   /**
    * In cases where incremental analysis is enabled, try to scan a raw file without parsing its content.
    *
-   * @param inputFile    The file to scan
+   * @param inputFile The file to scan
    * @return True if all scanners successfully scan the file without contents. False otherwise.
    */
   public boolean scanWithoutParsing(InputFile inputFile) {
@@ -183,7 +199,7 @@ public class VisitorsBridge {
       List<JavaFileScanner> scannersNotRequiringParsing = new ArrayList<>();
 
       var fileScannerContext = createScannerContext(sonarComponents, inputFile, javaVersion, inAndroidContext, cacheContext);
-      for (var scanner: scannersThatCannotBeSkipped) {
+      for (var scanner : scannersThatCannotBeSkipped) {
         boolean exceptionIsBlownUp = false;
         PerformanceMeasure.Duration scannerDuration = PerformanceMeasure.start(scanner);
         try {
@@ -248,7 +264,7 @@ public class VisitorsBridge {
     JavaFileScannerContext javaFileScannerContext = createScannerContext(tree, tree.sema, sonarComponents, fileParsed);
     var scanners = getScanners(fileCanBeSkipped);
 
-    PerformanceMeasure.Duration scannersDuration = PerformanceMeasure.start("Scanners");
+    PerformanceMeasure.Duration scannersDuration = PerformanceMeasure.start("Scanners(" + scanners.size() + ")");
     for (JavaFileScanner scanner : scanners) {
       PerformanceMeasure.Duration scannerDuration = PerformanceMeasure.start(scanner);
       try {
@@ -322,6 +338,21 @@ public class VisitorsBridge {
 
   protected JavaFileScannerContext createScannerContext(
     CompilationUnitTree tree, @Nullable Sema semanticModel, SonarComponents sonarComponents, boolean fileParsed) {
+
+    return new DisableReportCheck(
+      new DefaultJavaFileScannerContext(
+        tree,
+        currentFile,
+        semanticModel,
+        sonarComponents,
+        javaVersion,
+        fileParsed,
+        inAndroidContext,
+        cacheContext
+      )
+    );
+
+    /*
     return new DefaultJavaFileScannerContext(
       tree,
       currentFile,
@@ -332,6 +363,7 @@ public class VisitorsBridge {
       inAndroidContext,
       cacheContext
     );
+    */
   }
 
   protected ModuleScannerContext createScannerContext(
@@ -401,7 +433,7 @@ public class VisitorsBridge {
     public boolean scanWithoutParsing(InputFileScannerContext fileScannerContext) throws AnalysisException {
       boolean allScansSucceeded = true;
       for (SubscriptionVisitor visitor : subscriptionVisitors) {
-        PerformanceMeasure.Duration duration = PerformanceMeasure.start(visitor);
+        //PerformanceMeasure.Duration duration = PerformanceMeasure.start(visitor);
         try {
           allScansSucceeded &= visitor.scanWithoutParsing(fileScannerContext);
         } catch (Exception e) {
@@ -414,7 +446,7 @@ public class VisitorsBridge {
           LOG.warn(failureMessage);
           interruptIfFailFast(new CheckFailureException(failureMessage, e));
         } finally {
-          duration.stop();
+          // duration.stop();
         }
       }
       return allScansSucceeded;
@@ -422,7 +454,7 @@ public class VisitorsBridge {
 
     @Override
     public void scanFile(JavaFileScannerContext javaFileScannerContext) {
-      PerformanceMeasure.Duration issuableSubscriptionVisitorsDuration = PerformanceMeasure.start("IssuableSubscriptionVisitors");
+      // PerformanceMeasure.Duration issuableSubscriptionVisitorsDuration = PerformanceMeasure.start("IssuableSubscriptionVisitors");
       try {
         forEach(subscriptionVisitors, s -> s.setContext(javaFileScannerContext));
         visit(javaFileScannerContext.getTree());
@@ -430,7 +462,7 @@ public class VisitorsBridge {
       } catch (CheckFailureException e) {
         interruptIfFailFast(e);
       } finally {
-        issuableSubscriptionVisitorsDuration.stop();
+        // issuableSubscriptionVisitorsDuration.stop();
       }
     }
 
@@ -476,10 +508,223 @@ public class VisitorsBridge {
 
     private final void forEach(Collection<SubscriptionVisitor> visitors, Consumer<SubscriptionVisitor> callback) throws CheckFailureException {
       for (SubscriptionVisitor visitor : visitors) {
-        PerformanceMeasure.Duration visitorDuration = PerformanceMeasure.start(visitor);
+        // PerformanceMeasure.Duration visitorDuration = PerformanceMeasure.start(visitor);
         runScanner(() -> callback.accept(visitor), visitor);
-        visitorDuration.stop();
+        // visitorDuration.stop();
       }
+    }
+  }
+
+  private class QueryVisitorsRunner implements JavaFileScanner {
+
+    private final ExecutionGraph<?, CompilationUnitTree> executionGraph;
+
+    private QueryVisitorsRunner(ExecutionGraph<?, CompilationUnitTree> executionGraph) {
+      this.executionGraph = executionGraph;
+    }
+
+    @Override
+    public void scanFile(JavaFileScannerContext context) {
+      executionGraph.execute(createContext(context), context.getTree());
+    }
+
+    private ExecutionContext createContext(JavaFileScannerContext javaFileScannerContext) {
+      PerformanceMeasure.Duration duration = PerformanceMeasure.start("TreeFlattening");
+      ExecutionContext ctx = new ExecutionContext(javaFileScannerContext);
+      duration.stop();
+      return ctx;
+    }
+  }
+
+  private class DisableReportCheck implements JavaFileScannerContext, FluentReporting {
+
+    private final JavaFileScannerContext context;
+
+    private DisableReportCheck(JavaFileScannerContext context) {
+      this.context = context;
+    }
+
+    @Nullable
+    @Override
+    public Object getSemanticModel() {
+      return context.getSemanticModel();
+    }
+
+    @Override
+    public CompilationUnitTree getTree() {
+      return context.getTree();
+    }
+
+    @Override
+    public boolean fileParsed() {
+      return context.fileParsed();
+    }
+
+    @Override
+    public List<Tree> getComplexityNodes(Tree tree) {
+      return context.getComplexityNodes(tree);
+    }
+
+    @Override
+    public void reportIssue(JavaCheck javaCheck, Tree tree, String message) {
+      // do nothing
+    }
+
+    @Override
+    public void reportIssue(JavaCheck javaCheck, Tree tree, String message, List<Location> secondaryLocations, @org.jetbrains.annotations.Nullable Integer cost) {
+      // do nothing
+    }
+
+    @Override
+    public void reportIssueWithFlow(JavaCheck javaCheck, Tree tree, String message, Iterable<List<Location>> flows, @org.jetbrains.annotations.Nullable Integer cost) {
+      // do nothing
+    }
+
+    @Override
+    public void reportIssue(JavaCheck javaCheck, Tree startTree, Tree endTree, String message) {
+      // do nothing
+    }
+
+    @Override
+    public void reportIssue(JavaCheck javaCheck, Tree startTree, Tree endTree, String message, List<Location> secondaryLocations, @org.jetbrains.annotations.Nullable Integer cost) {
+      // do nothing
+    }
+
+    @Override
+    public List<String> getFileLines() {
+      return context.getFileLines();
+    }
+
+    @Override
+    public String getFileContent() {
+      return context.getFileContent();
+    }
+
+    @Override
+    public Optional<SourceMap> sourceMap() {
+      return context.sourceMap();
+    }
+
+    @Override
+    public void addIssueOnFile(JavaCheck check, String message) {
+      // do nothing
+    }
+
+    @Override
+    public void addIssue(int line, JavaCheck check, String message) {
+      // do nothing
+    }
+
+    @Override
+    public void addIssue(int line, JavaCheck check, String message, @org.jetbrains.annotations.Nullable Integer cost) {
+      // do nothing
+    }
+
+    @Override
+    public InputFile getInputFile() {
+      return context.getInputFile();
+    }
+
+    @Override
+    public void addIssueOnProject(JavaCheck check, String message) {
+      // do nothing
+    }
+
+    @Override
+    public InputComponent getProject() {
+      return context.getProject();
+    }
+
+    @Deprecated(since = "7.12")
+    @Override
+    public File getWorkingDirectory() {
+      return context.getWorkingDirectory();
+    }
+
+    @Override
+    public JavaVersion getJavaVersion() {
+      return context.getJavaVersion();
+    }
+
+    @Override
+    public boolean inAndroidContext() {
+      return context.inAndroidContext();
+    }
+
+    @Override
+    public CacheContext getCacheContext() {
+      return context.getCacheContext();
+    }
+
+    @Override
+    public File getRootProjectWorkingDirectory() {
+      return context.getRootProjectWorkingDirectory();
+    }
+
+    @Override
+    public String getModuleKey() {
+      return context.getModuleKey();
+    }
+
+    @CheckForNull
+    @Override
+    public SonarProduct sonarProduct() {
+      return context.sonarProduct();
+    }
+
+    @Override
+    public JavaIssueBuilder newIssue() {
+      return new JavaIssueBuilder() {
+        @Override
+        public JavaIssueBuilder forRule(JavaCheck rule) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder onTree(Tree tree) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder onRange(Tree from, Tree to) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder withMessage(String message) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder withMessage(String message, Object... args) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder withSecondaries(Location... secondaries) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder withSecondaries(List<Location> secondaries) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder withFlows(List<List<Location>> flows) {
+          return this;
+        }
+
+        @Override
+        public JavaIssueBuilder withCost(int cost) {
+          return this;
+        }
+
+        @Override
+        public void report() {
+          // do nothing
+        }
+      };
     }
   }
 }

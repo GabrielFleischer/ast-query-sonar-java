@@ -8,8 +8,8 @@ class A {
     int a = System.exit(0); // Noncompliant {{Remove this call to "exit" or ensure it is really required.}}
 //          ^^^^^^^^^^^
     System.gc();             // Compliant
-    exit();                  // Compliant
-    Runtime.getRuntime().exit(); // Noncompliant {{Remove this call to "exit" or ensure it is really required.}}
+    exit(0);                  // Compliant
+    Runtime.getRuntime().exit(3); // Noncompliant {{Remove this call to "exit" or ensure it is really required.}}
 //  ^^^^^^^^^^^^^^^^^^^^^^^^^
     Object o = Runtime.getRuntime().foo;    // Compliant
     Runtime.getRuntime().foo();  // Compliant
@@ -18,7 +18,10 @@ class A {
 
   public static void main(String[] args) {
     Runtime.getRuntime().halt(12); // Compliant
-    Runtime.getRuntime().exit();   // Compliant
+    Runtime.getRuntime().exit(15);   // Compliant
     System.exit(0);                // Compliant
+  }
+
+  private void exit(int code) {
   }
 }

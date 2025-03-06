@@ -17,6 +17,8 @@
 package org.sonar.java;
 
 import com.google.gson.Gson;
+import org.sonar.check.Rule;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
@@ -29,7 +31,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import org.sonar.check.Rule;
 
 public class CheckListGenerator {
   private static final String CLASS_NAME = "GeneratedCheckList";
@@ -85,12 +86,33 @@ public class CheckListGenerator {
 
   private List<String> getCheckFiles() {
     try (Stream<Path> stream = Stream.concat(Files.walk(relativePath.resolve("org/sonar/java/checks")), Files.walk(awsRelativePath.resolve("org/sonar/java/checks")))) {
-      return stream
+      var checks = stream
         .map(p -> p.startsWith(awsRelativePath) ? awsRelativePath.relativize(p).toString() : relativePath.relativize(p).toString())
-        .filter(file -> file.endsWith("Check.java"))
-        .map(file -> file.replace(".java", "").replace(File.separator, "."))
+        .filter(file -> file.endsWith("Check.java") || file.endsWith("CheckKT.kt"))
+        .map(file -> file.replace(".java", "").replace(".kt", "").replace(File.separator, "."))
         .sorted()
         .toList();
+
+      boolean useKtChecks = true;
+
+      if (useKtChecks) {
+        var ktChecks = checks.stream()
+          .filter(check -> check.endsWith("CheckKT"))
+          .map(file -> file
+            .replace(".queryAPI", "")
+            .replace("CheckKT", "Check")
+            .replace(File.separator, "."))
+          .collect(Collectors.toUnmodifiableSet());
+
+        return checks.stream()
+          .filter(check -> !ktChecks.contains(check))
+          .sorted()
+          .toList();
+      } else {
+        return checks.stream()
+          .filter(check -> !check.endsWith("CheckKT"))
+          .toList();
+      }
     } catch (IOException e) {
       throw new IllegalStateException(e.getMessage());
     }

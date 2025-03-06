@@ -17,6 +17,7 @@
     <module>autoscan</module>
     <module>plugin</module>
     <module>ruling</module>
+    <module>perf</module>
   </modules>
 
   <properties>

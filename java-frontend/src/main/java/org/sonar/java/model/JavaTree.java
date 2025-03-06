@@ -169,7 +169,7 @@ public abstract class JavaTree implements Tree {
     private final Map<JProblem.Type, Set<JWarning>> warnings = new EnumMap<>(JProblem.Type.class);
 
     public CompilationUnitTreeImpl(@Nullable PackageDeclarationTree packageDeclaration, List<ImportClauseTree> imports, List<Tree> types,
-      @Nullable ModuleDeclarationTree moduleDeclaration, SyntaxToken eofToken) {
+                                   @Nullable ModuleDeclarationTree moduleDeclaration, SyntaxToken eofToken) {
       this.root = this;
       this.packageDeclaration = packageDeclaration;
       this.imports = imports;
@@ -287,7 +287,7 @@ public abstract class JavaTree implements Tree {
       return ListUtils.concat(
         annotations,
         Arrays.asList(packageKeyword, packageName, semicolonToken)
-        );
+      );
     }
 
     public static String packageNameAsString(@Nullable PackageDeclarationTree tree) {
